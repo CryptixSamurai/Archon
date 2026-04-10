@@ -20,6 +20,7 @@ import {
 import type {
   SafeConfigResponse,
   CodebaseResponse,
+  HealthResponse,
   ProviderDefaults,
   ProviderInfo,
 } from '@/lib/api';
@@ -607,15 +608,17 @@ function AssistantConfigSection({ config }: { config: SafeConfigResponse }): Rea
 
 function PlatformConnectionsSection({
   adapter,
+  adapters,
 }: {
   adapter: string | undefined;
+  adapters: HealthResponse['adapters'] | undefined;
 }): React.ReactElement {
   const platforms = [
     { name: 'Web', connected: adapter === 'web' },
-    { name: 'Slack', connected: false },
-    { name: 'Telegram', connected: false },
-    { name: 'Discord', connected: false },
-    { name: 'GitHub', connected: false },
+    { name: 'Slack', connected: adapters?.slack ?? false },
+    { name: 'Telegram', connected: adapters?.telegram ?? false },
+    { name: 'Discord', connected: adapters?.discord ?? false },
+    { name: 'GitHub', connected: adapters?.github ?? false },
   ];
 
   return (
@@ -716,7 +719,7 @@ export function SettingsPage(): React.ReactElement {
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             {configData && <AssistantConfigSection config={configData.config} />}
-            <PlatformConnectionsSection adapter={health?.adapter} />
+            <PlatformConnectionsSection adapter={health?.adapter} adapters={health?.adapters} />
           </div>
 
           <ProjectsSection />
