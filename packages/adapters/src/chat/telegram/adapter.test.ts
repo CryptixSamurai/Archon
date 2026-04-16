@@ -94,8 +94,8 @@ describe('TelegramAdapter', () => {
         expect.any(String),
         expect.objectContaining({ parse_mode: 'MarkdownV2' })
       );
-      // Second call plain text fallback (no parse_mode)
-      expect(mockSendMessage).toHaveBeenNthCalledWith(2, 12345, expect.any(String));
+      // Second call plain text fallback (no parse_mode, threadExtra is undefined for non-forum chats)
+      expect(mockSendMessage).toHaveBeenNthCalledWith(2, 12345, expect.any(String), undefined);
     });
 
     test('should split long messages into multiple chunks', async () => {
@@ -160,9 +160,10 @@ describe('TelegramAdapter', () => {
 
       // 2 calls: 1 failed MarkdownV2 + 1 plain text fallback
       expect(mockSendMessage).toHaveBeenCalledTimes(2);
-      // Second call has no parse_mode (plain text)
+      // Second call has no parse_mode (plain text, threadExtra is undefined for non-forum chats)
       const secondCall = mockSendMessage.mock.calls[1];
-      expect(secondCall.length).toBe(2); // (id, text) — no options object
+      expect(secondCall.length).toBe(3); // (id, text, threadExtra=undefined)
+      expect(secondCall[2]).toBeUndefined();
     });
   });
 
