@@ -11,5 +11,81 @@ description: |
   automatically resolving where intent is clear, and presenting options for complex conflicts.
 
 nodes:
+  - id: load-memory
+    bash: |
+      if command -v bd &>/dev/null && [ -d ".beads" ]; then
+        echo "=== AGENT LESSONS ==="
+        bd list --label lesson --status open --json 2>/dev/null || echo "[]"
+        echo ""
+        echo "=== MEMORIES ==="
+        bd memories 2>/dev/null || echo "none"
+      else
+        echo "no beads configured"
+      fi
+
   - id: resolve
     command: archon-resolve-merge-conflicts
+    depends_on: [load-memory]
+
+  - id: update-docs
+    depends_on: [resolve]
+    context: fresh
+    model: sonnet
+    prompt: |
+      # Update Project Documentation
+
+      Code changes are complete. Update any documentation affected by these changes.
+
+      ## Step 1: Check what changed
+      ```bash
+      git diff $BASE_BRANCH..HEAD --stat
+      git diff $BASE_BRANCH..HEAD --name-only
+      ```
+
+      ## Step 2: Read project docs
+      Check which docs exist:
+      ```bash
+      ls README.md CLAUDE.md docs/ 2>/dev/null
+      ```
+
+      ## Step 3: Update only affected docs
+      - **README.md** — if new features, APIs, or usage patterns were added
+      - **CLAUDE.md** — if new conventions or architectural patterns emerged
+      - **docs/** files — if specific documentation exists for changed areas
+      - **API docs** — if endpoints or interfaces changed
+      - **Config docs** — if new configuration options were added
+
+      Rules:
+      - Only update docs that are ACTUALLY affected by the code changes
+      - Don't touch docs for unchanged areas
+      - Don't create new doc files unless explicitly needed
+      - Keep updates concise and factual
+
+      ## Step 4: Commit if changes were made
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "docs: update documentation for recent changes"
+      ```
+
+      If no docs need updating, output "No documentation updates needed" and skip commit.
+
+      ## Step 5: Verify all changes are committed
+      ```bash
+      git status --porcelain
+      ```
+      If there are uncommitted files, stage and commit them:
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "chore: commit remaining uncommitted changes"
+      ```
+      Verify clean state:
+      ```bash
+      git status
+      ```
+      If working directory is NOT clean after this — something is wrong. Report it in your output.
+
+  - id: save-memory
+    depends_on: [update-docs]
+    bash: |
+      command -v bd &>/dev/null && [ -d ".beads" ] || exit 0
+      bd remember "Completed: archon-resolve-conflicts — merge conflicts resolved" 2>/dev/null || true

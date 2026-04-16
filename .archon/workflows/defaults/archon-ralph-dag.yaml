@@ -16,11 +16,29 @@ provider: claude
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
+  # NODE 0: LOAD MEMORY
+  # Read beads lessons and patterns from past runs
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: load-memory
+    bash: |
+      if command -v bd &>/dev/null && [ -d ".beads" ]; then
+        echo "=== AGENT LESSONS ==="
+        bd list --label lesson --status open --json 2>/dev/null || echo "[]"
+        echo ""
+        echo "=== MEMORIES ==="
+        bd memories 2>/dev/null || echo "none"
+      else
+        echo "no beads configured"
+      fi
+
+  # ═══════════════════════════════════════════════════════════════
   # NODE 1: DETECT INPUT
   # Determines what the user provided: full PRD, partial PRD, or idea
   # ═══════════════════════════════════════════════════════════════
 
   - id: detect-input
+    depends_on: [load-memory]
     model: haiku
     prompt: |
       # Detect Ralph Input
@@ -208,6 +226,9 @@ nodes:
         $validate-prd.output
 
         **User message**: $USER_MESSAGE
+
+        **Agent memory (from past runs):**
+        $load-memory.output
 
         ---
 
@@ -649,12 +670,143 @@ nodes:
       fresh_context: true
 
   # ═══════════════════════════════════════════════════════════════
-  # NODE 5: COMPLETION REPORT
+  # NODE 5: CODEX ADVERSARIAL REVIEW
+  # Independent model challenges the full implementation
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: codex-review
+    depends_on: [implement]
+    context: fresh
+    provider: codex
+    model: gpt-5.4
+    idle_timeout: 3600000
+    prompt: |
+      You are an adversarial code reviewer. A different AI implemented a multi-story
+      feature from a PRD. Your job: challenge the implementation and find problems.
+
+      Run `git diff $BASE_BRANCH...HEAD` to see all changes.
+
+      ## Review Checklist
+
+      1. **Acceptance Criteria** — does the implementation actually satisfy each story's criteria?
+      2. **Edge Cases** — boundary conditions, null values, error paths?
+      3. **Side Effects** — does it break existing functionality?
+      4. **Test Quality** — do tests verify real behavior or just happy path?
+      5. **Security** — injection, auth bypass, data leaks?
+      6. **Consistency** — do all stories follow the same patterns, or is there drift?
+
+      ## Output
+      ```json
+      {
+        "verdict": "PASS" | "NEEDS_FIXES",
+        "critical_issues": [{"description": "...", "file": "...", "suggestion": "..."}],
+        "minor_issues": [{"description": "...", "file": "...", "suggestion": "..."}],
+        "positive_notes": ["what was done well"]
+      }
+      ```
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 5b: FIX CODEX FINDINGS (only if needed)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fix-codex
+    depends_on: [codex-review]
+    when: "$codex-review.output.verdict == 'NEEDS_FIXES'"
+    context: fresh
+    model: claude-opus-4-6[1m]
+    idle_timeout: 3600000
+    prompt: |
+      An independent reviewer (Codex) found issues with the implementation. Fix them.
+
+      ## Findings
+      $codex-review.output
+
+      ## Instructions
+      1. Read each issue, implement fix
+      2. Run full validation: `bun run type-check && bun run lint && bun run test`
+      3. Commit: `git add -A && git commit -m "fix: address adversarial review findings"`
+      4. Push: `git push -u origin HEAD`
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 5c: RE-VALIDATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: re-validate
+    depends_on: [codex-review, fix-codex]
+    trigger_rule: one_success
+    bash: |
+      echo "=== FINAL VALIDATION ==="
+      bun run type-check && bun run lint && bun run test && bun run format:check
+      echo "EXIT_CODE=$?"
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 6: UPDATE DOCUMENTATION
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: update-docs
+    depends_on: [re-validate]
+    context: fresh
+    model: sonnet
+    prompt: |
+      # Update Project Documentation
+
+      Code changes are complete. Update any documentation affected by these changes.
+
+      ## Step 1: Check what changed
+      ```bash
+      git diff $BASE_BRANCH..HEAD --stat
+      git diff $BASE_BRANCH..HEAD --name-only
+      ```
+
+      ## Step 2: Read project docs
+      Check which docs exist:
+      ```bash
+      ls README.md CLAUDE.md docs/ 2>/dev/null
+      ```
+
+      ## Step 3: Update only affected docs
+      - **README.md** — if new features, APIs, or usage patterns were added
+      - **CLAUDE.md** — if new conventions or architectural patterns emerged
+      - **docs/** files — if specific documentation exists for changed areas
+      - **API docs** — if endpoints or interfaces changed
+      - **Config docs** — if new configuration options were added
+
+      Rules:
+      - Only update docs that are ACTUALLY affected by the code changes
+      - Don't touch docs for unchanged areas
+      - Don't create new doc files unless explicitly needed
+      - Keep updates concise and factual
+
+      ## Step 4: Commit if changes were made
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "docs: update documentation for recent changes"
+      ```
+
+      If no docs need updating, output "No documentation updates needed" and skip commit.
+
+      ## Step 5: Verify all changes are committed
+      ```bash
+      git status --porcelain
+      ```
+      If there are uncommitted files, stage and commit them:
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "chore: commit remaining uncommitted changes"
+      ```
+      Verify clean state:
+      ```bash
+      git status
+      ```
+      If working directory is NOT clean after this — something is wrong. Report it in your output.
+
+  # ═══════════════════════════════════════════════════════════════
+  # NODE 7: COMPLETION REPORT
   # Reads final state and produces a summary.
   # ═══════════════════════════════════════════════════════════════
 
   - id: report
-    depends_on: [implement]
+    depends_on: [update-docs]
     prompt: |
       # Completion Report
 
@@ -735,3 +887,24 @@ nodes:
       ```
 
       Keep it factual. No commentary — just the data.
+
+      ### 5. Save Lessons to Beads
+
+      If `bd` is available:
+      ```bash
+      command -v bd &>/dev/null || exit 0
+      ```
+
+      Save key learnings from this run:
+      - Codebase patterns discovered (from progress.txt `## Codebase Patterns`)
+      - Any issues Codex found: `$codex-review.output`
+      - Any stories that were blocked or failed
+
+      ```bash
+      bd remember "Ralph: {feature name} — {N}/{M} stories, codex: {PASS/NEEDS_FIXES}" 2>/dev/null || true
+      ```
+
+      For each significant lesson from progress.txt:
+      ```bash
+      bd create --title="{lesson}" --type=task --priority=3 --label lesson --label ralph 2>/dev/null || true
+      ```

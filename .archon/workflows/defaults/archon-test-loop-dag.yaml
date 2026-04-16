@@ -6,7 +6,20 @@ description: |
   Does: Initializes a counter, iterates until it reaches 3, then reports completion.
 
 nodes:
+  - id: load-memory
+    bash: |
+      if command -v bd &>/dev/null && [ -d ".beads" ]; then
+        echo "=== AGENT LESSONS ==="
+        bd list --label lesson --status open --json 2>/dev/null || echo "[]"
+        echo ""
+        echo "=== MEMORIES ==="
+        bd memories 2>/dev/null || echo "none"
+      else
+        echo "no beads configured"
+      fi
+
   - id: setup
+    depends_on: [load-memory]
     bash: |
       echo "0" > .archon/test-loop-dag-counter.txt
       echo "Counter initialized to 0"
@@ -50,3 +63,11 @@ nodes:
 
       Read `.archon/test-loop-dag-counter.txt` and confirm the final counter value.
       Report: "Test loop DAG completed successfully. Final counter: {value}"
+
+      ## Save Lessons to Beads
+
+      If `bd` is available, save key learnings:
+      ```bash
+      command -v bd &>/dev/null && [ -d ".beads" ] || exit 0
+      bd remember "Completed: archon-test-loop-dag — loop test finished" 2>/dev/null || true
+      ```

@@ -11,8 +11,21 @@ description: |
   the review agents that are relevant. A 3-line typo fix skips test-coverage and docs-impact.
 
 nodes:
+  - id: load-memory
+    bash: |
+      if command -v bd &>/dev/null && [ -d ".beads" ]; then
+        echo "=== AGENT LESSONS ==="
+        bd list --label lesson --status open --json 2>/dev/null || echo "[]"
+        echo ""
+        echo "=== MEMORIES ==="
+        bd memories 2>/dev/null || echo "none"
+      else
+        echo "no beads configured"
+      fi
+
   - id: scope
     command: archon-pr-review-scope
+    depends_on: [load-memory]
 
   - id: sync
     command: archon-sync-pr-with-main
@@ -138,3 +151,10 @@ nodes:
       - title: "PR Review Complete"
       - message: 1-2 sentence summary — verdict and issue count. Short enough for a lock screen.
       - priority: 3 if ready to merge, 4 if needs fixes, 5 if critical issues remain
+
+  - id: save-memory
+    depends_on: [implement-fixes, notify]
+    trigger_rule: all_done
+    bash: |
+      command -v bd &>/dev/null && [ -d ".beads" ] || exit 0
+      bd remember "Completed: archon-smart-pr-review — PR reviewed with smart agent routing" 2>/dev/null || true

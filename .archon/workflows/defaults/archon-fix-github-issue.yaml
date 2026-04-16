@@ -19,13 +19,31 @@ description: |
 
 provider: claude
 model: sonnet
+interactive: true
 
 nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 0: LOAD MEMORY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: load-memory
+    bash: |
+      if command -v bd &>/dev/null && [ -d ".beads" ]; then
+        echo "=== AGENT LESSONS ==="
+        bd list --label lesson --status open --json 2>/dev/null || echo "[]"
+        echo ""
+        echo "=== MEMORIES ==="
+        bd memories 2>/dev/null || echo "none"
+      else
+        echo "no beads configured"
+      fi
+
   # ═══════════════════════════════════════════════════════════════
   # PHASE 1: FETCH & CLASSIFY
   # ═══════════════════════════════════════════════════════════════
 
   - id: extract-issue-number
+    depends_on: [load-memory]
     prompt: |
       Find the GitHub issue number for this request.
 
@@ -126,12 +144,70 @@ nodes:
     trigger_rule: one_success
 
   # ═══════════════════════════════════════════════════════════════
+  # PHASE 3b: APPROVAL GATE
+  # Show the user what was understood and planned before implementing
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: review-plan
+    depends_on: [bridge-artifacts]
+    model: claude-opus-4-6[1m]
+    loop:
+      prompt: |
+        # Plan Review — Interactive Gate
+
+        The user is reviewing the investigation/plan before implementation starts.
+
+        **User's feedback**: $LOOP_USER_INPUT
+
+        ## Context
+
+        - **Issue:** $ARGUMENTS
+        - **Type:** $classify.output.issue_type — $classify.output.title
+        - **Classification reasoning:** $classify.output.reasoning
+
+        ## Step 1: Read the Plan
+
+        Read `$ARTIFACTS_DIR/investigation.md` (or `$ARTIFACTS_DIR/plan.md` if it exists).
+
+        ## Step 2: Process User Input
+
+        **If no user feedback yet** (first iteration, $LOOP_USER_INPUT is empty):
+        - Present a clear summary of:
+          1. What the problem is (root cause for bugs, scope for features)
+          2. What files will be changed and how
+          3. What tests will be added/modified
+          4. Any risks or trade-offs
+        - Ask the user to review
+        - Do NOT emit the completion signal on the first iteration
+
+        **If the user EXPLICITLY approved** (said "approved", "ok", "go", "looks good", "давай", "ок"):
+        - Make no changes
+        - Output: "Plan approved. Proceeding to implementation."
+        - Signal completion: <promise>PLAN_APPROVED</promise>
+
+        **If the user provided feedback or corrections:**
+        - Parse the feedback
+        - Update `$ARTIFACTS_DIR/investigation.md` with the requested changes
+        - Present the updated plan summary
+        - Ask: "Updated the plan. Review again or say 'approved' to start implementation."
+        - Do NOT emit the signal
+
+        **CRITICAL**: NEVER emit <promise>PLAN_APPROVED</promise> unless the user's latest
+        message EXPLICITLY approves. Questions, corrections, concerns are NOT approval.
+      until: PLAN_APPROVED
+      max_iterations: 10
+      interactive: true
+      gate_message: |
+        Review the plan above. Provide feedback on what to change,
+        or say "approved" to begin implementation.
+
+  # ═══════════════════════════════════════════════════════════════
   # PHASE 4: IMPLEMENT
   # ═══════════════════════════════════════════════════════════════
 
   - id: implement
     command: archon-fix-issue
-    depends_on: [bridge-artifacts]
+    depends_on: [review-plan]
     context: fresh
     model: claude-opus-4-6[1m]
 
@@ -142,6 +218,128 @@ nodes:
   - id: validate
     command: archon-validate
     depends_on: [implement]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5b: ADVERSARIAL REVIEW (Codex)
+  # Independent model challenges the implementation
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: codex-challenge
+    depends_on: [validate]
+    context: fresh
+    provider: codex
+    model: gpt-5.4
+    idle_timeout: 3600000
+    prompt: |
+      You are an adversarial code reviewer. A different AI model just implemented
+      a fix for a GitHub issue. Your job is to CHALLENGE the implementation — find
+      problems the original model missed due to its own blind spots.
+
+      ## Issue Context
+
+      $fetch-issue.output
+
+      ## Classification
+
+      Type: $classify.output.issue_type
+      Title: $classify.output.title
+
+      ## What Was Done
+
+      The implementation is in the current working directory. The validation
+      step confirmed that type-check, lint, and tests pass.
+
+      ## Your Review Checklist
+
+      Run `git diff $BASE_BRANCH...HEAD` to see all changes, then evaluate:
+
+      ### 1. Root Cause vs Symptom
+      - Does the fix address the ACTUAL root cause?
+      - Or does it just suppress the symptom (e.g., catching an error instead of preventing it)?
+      - Could the same bug reappear in a different form?
+
+      ### 2. Edge Cases
+      - What inputs or conditions were NOT tested?
+      - Are there boundary conditions (empty arrays, null values, concurrent access)?
+      - What happens under load or with unexpected data?
+
+      ### 3. Side Effects
+      - Does the fix change behavior of any OTHER functionality?
+      - Are there callers of the modified code that might break?
+      - Run: `grep -rn "function_name" --include="*.ts"` for each modified function
+
+      ### 4. Simpler Alternative
+      - Is there a simpler way to achieve the same fix?
+      - Is the fix over-engineered for the problem?
+      - Could fewer lines of code solve this?
+
+      ### 5. Test Quality
+      - Do the tests actually verify the FIX, or just the happy path?
+      - Is there a regression test that would catch this bug if it reappeared?
+      - Are tests deterministic (no timing, no network dependency)?
+
+      ## Output Format
+
+      Return a JSON object:
+      ```json
+      {
+        "verdict": "PASS" | "NEEDS_FIXES",
+        "critical_issues": [
+          {"description": "...", "file": "...", "suggestion": "..."}
+        ],
+        "minor_issues": [
+          {"description": "...", "file": "...", "suggestion": "..."}
+        ],
+        "positive_notes": ["what was done well"]
+      }
+      ```
+
+      If no critical or minor issues found, set verdict to "PASS" with empty arrays.
+      Be thorough but fair — don't flag things that aren't real problems.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5c: FIX ADVERSARIAL FINDINGS
+  # Claude fixes issues found by Codex (only if needed)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: fix-challenge
+    depends_on: [codex-challenge]
+    when: "$codex-challenge.output.verdict == 'NEEDS_FIXES'"
+    context: fresh
+    model: claude-opus-4-6[1m]
+    idle_timeout: 3600000
+    prompt: |
+      An independent reviewer (Codex) found issues with your implementation.
+      Fix them.
+
+      ## Adversarial Review Results
+
+      $codex-challenge.output
+
+      ## Instructions
+
+      1. Read each critical_issue and minor_issue
+      2. For each issue:
+         - Read the file mentioned
+         - Understand the concern
+         - Implement the fix
+      3. After all fixes, run the full validation suite:
+         ```bash
+         bun run type-check && bun run lint && bun run test
+         ```
+      4. If validation fails, fix until it passes
+      5. Commit all changes: `git add -A && git commit -m "fix: address adversarial review findings"`
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5d: RE-VALIDATE
+  # Ensure everything still passes after adversarial fixes
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: re-validate
+    command: archon-validate
+    depends_on: [codex-challenge, fix-challenge]
+    trigger_rule: one_success
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════
@@ -180,7 +378,7 @@ nodes:
          PR_URL=$(gh pr view --json url -q '.url')
          echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
          ```
-    depends_on: [validate]
+    depends_on: [re-validate]
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════
@@ -301,10 +499,81 @@ nodes:
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════
-  # PHASE 10: REPORT
+  # PHASE 10: UPDATE DOCUMENTATION
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: update-docs
+    depends_on: [simplify]
+    context: fresh
+    model: sonnet
+    prompt: |
+      # Update Project Documentation
+
+      Code changes are complete. Update any documentation affected by these changes.
+
+      ## Step 1: Check what changed
+      ```bash
+      git diff $BASE_BRANCH..HEAD --stat
+      git diff $BASE_BRANCH..HEAD --name-only
+      ```
+
+      ## Step 2: Read project docs
+      Check which docs exist:
+      ```bash
+      ls README.md CLAUDE.md docs/ 2>/dev/null
+      ```
+
+      ## Step 3: Update only affected docs
+      - **README.md** — if new features, APIs, or usage patterns were added
+      - **CLAUDE.md** — if new conventions or architectural patterns emerged
+      - **docs/** files — if specific documentation exists for changed areas
+      - **API docs** — if endpoints or interfaces changed
+      - **Config docs** — if new configuration options were added
+
+      Rules:
+      - Only update docs that are ACTUALLY affected by the code changes
+      - Don't touch docs for unchanged areas
+      - Don't create new doc files unless explicitly needed
+      - Keep updates concise and factual
+
+      ## Step 4: Commit if changes were made
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "docs: update documentation for recent changes"
+      ```
+
+      If no docs need updating, output "No documentation updates needed" and skip commit.
+
+      ## Step 5: Verify all changes are committed
+      ```bash
+      git status --porcelain
+      ```
+      If there are uncommitted files, stage and commit them:
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "chore: commit remaining uncommitted changes"
+      ```
+      Verify clean state:
+      ```bash
+      git status
+      ```
+      If working directory is NOT clean after this — something is wrong. Report it in your output.
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 11: REPORT
   # ═══════════════════════════════════════════════════════════════
 
   - id: report
     command: archon-issue-completion-report
-    depends_on: [simplify]
+    depends_on: [update-docs]
     context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 12: SAVE MEMORY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: save-memory
+    depends_on: [report]
+    bash: |
+      command -v bd &>/dev/null && [ -d ".beads" ] || exit 0
+      bd remember "Completed: archon-fix-github-issue — issue fixed and PR created" 2>/dev/null || true

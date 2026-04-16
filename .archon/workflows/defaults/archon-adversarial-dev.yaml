@@ -16,8 +16,22 @@ provider: claude
 model: sonnet
 
 nodes:
+  # ─── Phase 0: Load Memory ────────────────────────────────────────────
+  - id: load-memory
+    bash: |
+      if command -v bd &>/dev/null && [ -d ".beads" ]; then
+        echo "=== AGENT LESSONS ==="
+        bd list --label lesson --status open --json 2>/dev/null || echo "[]"
+        echo ""
+        echo "=== MEMORIES ==="
+        bd memories 2>/dev/null || echo "none"
+      else
+        echo "no beads configured"
+      fi
+
   # ─── Phase 1: Planning ───────────────────────────────────────────────
   - id: plan
+    depends_on: [load-memory]
     prompt: |
       You are a product planning expert. Your job is to take a short user prompt and expand it
       into a comprehensive product specification.
@@ -300,9 +314,68 @@ nodes:
       until_bash: |
         grep -qE '"status"\s*:\s*"(complete|failed)"' "$ARTIFACTS_DIR/state.json"
 
-  # ─── Phase 4: Report ─────────────────────────────────────────────────
-  - id: report
+  # ─── Phase 4: Update Documentation ────────────────────────────────────
+  - id: update-docs
     depends_on: [adversarial-sprint]
+    trigger_rule: all_done
+    context: fresh
+    model: sonnet
+    prompt: |
+      # Update Project Documentation
+
+      Code changes are complete. Update any documentation affected by these changes.
+
+      ## Step 1: Check what changed
+      ```bash
+      git diff $BASE_BRANCH..HEAD --stat
+      git diff $BASE_BRANCH..HEAD --name-only
+      ```
+
+      ## Step 2: Read project docs
+      Check which docs exist:
+      ```bash
+      ls README.md CLAUDE.md docs/ 2>/dev/null
+      ```
+
+      ## Step 3: Update only affected docs
+      - **README.md** — if new features, APIs, or usage patterns were added
+      - **CLAUDE.md** — if new conventions or architectural patterns emerged
+      - **docs/** files — if specific documentation exists for changed areas
+      - **API docs** — if endpoints or interfaces changed
+      - **Config docs** — if new configuration options were added
+
+      Rules:
+      - Only update docs that are ACTUALLY affected by the code changes
+      - Don't touch docs for unchanged areas
+      - Don't create new doc files unless explicitly needed
+      - Keep updates concise and factual
+
+      ## Step 4: Commit if changes were made
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "docs: update documentation for recent changes"
+      ```
+
+      If no docs need updating, output "No documentation updates needed" and skip commit.
+
+      ## Step 5: Verify all changes are committed
+      ```bash
+      git status --porcelain
+      ```
+      If there are uncommitted files, stage and commit them:
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "chore: commit remaining uncommitted changes"
+      ```
+      Verify clean state:
+      ```bash
+      git status
+      ```
+      If working directory is NOT clean after this — something is wrong. Report it in your output.
+
+  # ─── Phase 5: Report ─────────────────────────────────────────────────
+  - id: report
+    depends_on: [update-docs]
     trigger_rule: all_done
     context: fresh
     model: haiku
@@ -341,4 +414,12 @@ nodes:
 
       Write this report to `$ARTIFACTS_DIR/report.md` AND output it as your response so the user
       sees it directly.
+
+      ## Save Lessons to Beads
+
+      If `bd` is available, save key learnings:
+      ```bash
+      command -v bd &>/dev/null && [ -d ".beads" ] || exit 0
+      bd remember "Completed: archon-adversarial-dev — {brief result summary}" 2>/dev/null || true
+      ```
     allowed_tools: [Read, Write, Glob, Grep]

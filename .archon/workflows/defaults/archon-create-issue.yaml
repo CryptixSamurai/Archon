@@ -13,10 +13,27 @@ description: |
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
+  # PHASE 0: LOAD MEMORY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: load-memory
+    bash: |
+      if command -v bd &>/dev/null && [ -d ".beads" ]; then
+        echo "=== AGENT LESSONS ==="
+        bd list --label lesson --status open --json 2>/dev/null || echo "[]"
+        echo ""
+        echo "=== MEMORIES ==="
+        bd memories 2>/dev/null || echo "none"
+      else
+        echo "no beads configured"
+      fi
+
+  # ═══════════════════════════════════════════════════════════════
   # PHASE 1: CLASSIFY — Haiku classification of user's problem
   # ═══════════════════════════════════════════════════════════════
 
   - id: classify
+    depends_on: [load-memory]
     prompt: |
       You are a problem classifier for the Archon codebase. Analyze the user's
       description and determine the issue type and which area of the system is affected.
@@ -473,6 +490,14 @@ nodes:
 
       Do NOT create a GitHub issue. The purpose of this node is to communicate back to the
       user so they can provide better information or investigate manually.
+
+      ## Save Lessons to Beads
+
+      If `bd` is available, save key learnings:
+      ```bash
+      command -v bd &>/dev/null && [ -d ".beads" ] || exit 0
+      bd remember "Completed: archon-create-issue — could not reproduce, no issue created" 2>/dev/null || true
+      ```
     depends_on: [check-reproduction]
     when: "$check-reproduction.output == 'NOT_REPRODUCED'"
     context: fresh
@@ -556,6 +581,64 @@ nodes:
   # PHASE 7: CREATE ISSUE
   # ═══════════════════════════════════════════════════════════════
 
+  - id: update-docs
+    depends_on: [draft-issue]
+    when: "$check-reproduction.output != 'NOT_REPRODUCED'"
+    context: fresh
+    model: sonnet
+    prompt: |
+      # Update Project Documentation
+
+      Code changes are complete. Update any documentation affected by these changes.
+
+      ## Step 1: Check what changed
+      ```bash
+      git diff $BASE_BRANCH..HEAD --stat
+      git diff $BASE_BRANCH..HEAD --name-only
+      ```
+
+      ## Step 2: Read project docs
+      Check which docs exist:
+      ```bash
+      ls README.md CLAUDE.md docs/ 2>/dev/null
+      ```
+
+      ## Step 3: Update only affected docs
+      - **README.md** — if new features, APIs, or usage patterns were added
+      - **CLAUDE.md** — if new conventions or architectural patterns emerged
+      - **docs/** files — if specific documentation exists for changed areas
+      - **API docs** — if endpoints or interfaces changed
+      - **Config docs** — if new configuration options were added
+
+      Rules:
+      - Only update docs that are ACTUALLY affected by the code changes
+      - Don't touch docs for unchanged areas
+      - Don't create new doc files unless explicitly needed
+      - Keep updates concise and factual
+
+      ## Step 4: Commit if changes were made
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "docs: update documentation for recent changes"
+      ```
+
+      If no docs need updating, output "No documentation updates needed" and skip commit.
+
+      ## Step 5: Verify all changes are committed
+      ```bash
+      git status --porcelain
+      ```
+      If there are uncommitted files, stage and commit them:
+      ```bash
+      git add -A
+      git diff --cached --quiet || git commit -m "chore: commit remaining uncommitted changes"
+      ```
+      Verify clean state:
+      ```bash
+      git status
+      ```
+      If working directory is NOT clean after this — something is wrong. Report it in your output.
+
   - id: create-issue
     prompt: |
       Create the GitHub issue using the drafted content.
@@ -592,5 +675,13 @@ nodes:
          - Labels applied
          - Whether duplicates were found
          - Summary of reproduction results (reproduced/partial)
-    depends_on: [draft-issue]
+
+      ## Save Lessons to Beads
+
+      If `bd` is available, save key learnings:
+      ```bash
+      command -v bd &>/dev/null && [ -d ".beads" ] || exit 0
+      bd remember "Completed: archon-create-issue — issue created with reproduction evidence" 2>/dev/null || true
+      ```
+    depends_on: [update-docs]
     context: fresh
