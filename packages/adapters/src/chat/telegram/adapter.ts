@@ -8,6 +8,7 @@ import { createLogger } from '@archon/paths';
 import { parseAllowedUserIds, isUserAuthorized } from './auth';
 import { convertToTelegramMarkdown, stripMarkdown } from './markdown';
 import { splitIntoParagraphChunks } from '../../utils/message-splitting';
+import { transcribeAudio, TranscriptionError } from './transcription';
 import type { TelegramMessageContext } from './types';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -280,44 +281,172 @@ export class TelegramAdapter implements IPlatformAdapter {
   }
 
   /**
+   * Route an inbound message (text, or transcribed voice/audio) to the
+   * registered `messageHandler`. Handles the common auth + conversation-id
+   * + logging path so text and audio sources share one code path.
+   */
+  private routeIncomingMessage(
+    ctx: Context,
+    message: string,
+    source: 'text' | 'voice' | 'audio' | 'video_note'
+  ): void {
+    const userId = ctx.from?.id;
+    if (!isUserAuthorized(userId, this.allowedUserIds)) {
+      const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
+      getLog().info({ maskedUserId: maskedId, source }, 'telegram.unauthorized_message');
+      return; // Silent rejection
+    }
+
+    if (!this.messageHandler) {
+      // Intentional: message dropped silently if handler not registered yet.
+      // In production the server always calls onMessage() before start(); this
+      // path only surfaces during development or misconfiguration.
+      getLog().debug({ chatId: ctx.chat?.id, source }, 'telegram.message_dropped_no_handler');
+      return;
+    }
+
+    const conversationId = this.getConversationId(ctx);
+    const msg = ctx.message;
+    const threadId =
+      msg && 'message_thread_id' in msg
+        ? (msg as { message_thread_id?: number }).message_thread_id
+        : undefined;
+    getLog().info(
+      { chatId: ctx.chat?.id, threadId, conversationId, chatType: ctx.chat?.type, source },
+      'telegram.message_received'
+    );
+    // Fire-and-forget - errors handled by caller
+    void this.messageHandler({ conversationId, message, userId });
+  }
+
+  /**
+   * Handle incoming voice/audio/video-note: download from Telegram CDN,
+   * transcribe via Groq Whisper, send the transcript back to the user as
+   * an ACK (so they can catch mistranscription), then route through the
+   * normal message pipeline.
+   *
+   * Transcription failures never silently drop the message — the user
+   * always gets a reply (either the transcript or a clear error).
+   */
+  private async handleAudioMessage(
+    ctx: Context,
+    kind: 'voice' | 'audio' | 'video_note'
+  ): Promise<void> {
+    const userId = ctx.from?.id;
+    if (!isUserAuthorized(userId, this.allowedUserIds)) {
+      const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
+      getLog().info({ maskedUserId: maskedId, kind }, 'telegram.unauthorized_audio');
+      return;
+    }
+
+    const replyTo = this.getConversationId(ctx);
+
+    // 1. Fetch file metadata (grammY handles getFile API)
+    let file: Awaited<ReturnType<typeof ctx.getFile>>;
+    try {
+      file = await ctx.getFile();
+    } catch (err) {
+      getLog().error({ err: err as Error, kind }, 'telegram.get_file_failed');
+      await this.sendMessage(replyTo, '❌ Could not fetch audio file from Telegram.');
+      return;
+    }
+    if (!file.file_path) {
+      getLog().error({ kind, fileId: file.file_id }, 'telegram.get_file_missing_path');
+      await this.sendMessage(replyTo, '❌ Telegram did not return a file path for this audio.');
+      return;
+    }
+
+    // 2. Download audio bytes from Telegram CDN
+    const downloadUrl = `https://api.telegram.org/file/bot${this.bot.token}/${file.file_path}`;
+    let audioBytes: Uint8Array;
+    try {
+      const res = await fetch(downloadUrl);
+      if (!res.ok) {
+        throw new Error(`Download HTTP ${String(res.status)}`);
+      }
+      audioBytes = new Uint8Array(await res.arrayBuffer());
+    } catch (err) {
+      getLog().error(
+        { err: err as Error, kind, filePath: file.file_path },
+        'telegram.audio_download_failed'
+      );
+      await this.sendMessage(replyTo, '❌ Could not download audio file from Telegram.');
+      return;
+    }
+
+    // 3. Transcribe via Groq Whisper
+    let transcriptText: string;
+    try {
+      const filename = file.file_path.split('/').pop() ?? `${kind}.ogg`;
+      const result = await transcribeAudio(audioBytes, filename);
+      transcriptText = result.text.trim();
+      if (!transcriptText) {
+        await this.sendMessage(replyTo, '🎙️ Empty transcription — try recording again.');
+        return;
+      }
+    } catch (err) {
+      const message = this.formatTranscriptionError(err);
+      getLog().warn(
+        { err: err as Error, kind, audioBytes: audioBytes.byteLength },
+        'telegram.transcription_failed'
+      );
+      await this.sendMessage(replyTo, message);
+      return;
+    }
+
+    // 4. ACK with transcript preview so user can catch mistranscription
+    const preview =
+      transcriptText.length > 500 ? `${transcriptText.slice(0, 500)}…` : transcriptText;
+    await this.sendMessage(replyTo, `🎙️ _${preview}_`);
+
+    // 5. Route through normal message pipeline (MarkdownV2 won't apply —
+    // transcripts are plain text, so formatting is preserved)
+    this.routeIncomingMessage(ctx, transcriptText, kind);
+  }
+
+  /** Map a TranscriptionError code to a user-friendly reply. */
+  private formatTranscriptionError(err: unknown): string {
+    if (err instanceof TranscriptionError) {
+      switch (err.code) {
+        case 'missing_key':
+          return '❌ Voice transcription is not configured (missing GROQ_API_KEY). Please send text instead.';
+        case 'rate_limit':
+          return '⏳ Transcription rate-limited. Try again in a minute, or send text.';
+        case 'timeout':
+          return '⏱️ Transcription timed out. Try a shorter recording or send text.';
+        case 'network_error':
+          return '❌ Transcription network error. Try again, or send text.';
+        case 'api_error':
+        case 'invalid_response':
+        default:
+          return '❌ Transcription failed. Please send text instead.';
+      }
+    }
+    return '❌ Unexpected transcription error. Please send text.';
+  }
+
+  /**
    * Start the bot (begins polling).
    * Makes up to 3 attempts on 409 Conflict (stale getUpdates connection).
    */
   async start(options?: { retryDelayMs?: number }): Promise<void> {
-    // Register message handler before launch
+    // Text handler — delegates to shared router
     this.bot.on('message:text', ctx => {
       const message = ctx.message.text;
       if (!message) return;
+      this.routeIncomingMessage(ctx, message, 'text');
+    });
 
-      // Authorization check - verify sender is in whitelist
-      const userId = ctx.from?.id;
-      if (!isUserAuthorized(userId, this.allowedUserIds)) {
-        // Log unauthorized attempt (mask user ID for privacy)
-        const maskedId = userId !== undefined ? `${String(userId).slice(0, 4)}***` : 'unknown';
-        getLog().info({ maskedUserId: maskedId }, 'telegram.unauthorized_message');
-        return; // Silent rejection
-      }
-
-      if (this.messageHandler) {
-        const conversationId = this.getConversationId(ctx);
-        // Debug: log forum topic detection
-        const msg = ctx.message;
-        const threadId =
-          'message_thread_id' in msg
-            ? (msg as { message_thread_id?: number }).message_thread_id
-            : undefined;
-        getLog().info(
-          { chatId: ctx.chat?.id, threadId, conversationId, chatType: ctx.chat?.type },
-          'telegram.message_received'
-        );
-        // Fire-and-forget - errors handled by caller
-        void this.messageHandler({ conversationId, message, userId });
-      } else {
-        // Intentional: message dropped silently if handler not registered yet.
-        // In production the server always calls onMessage() before start(); this
-        // path only surfaces during development or misconfiguration.
-        getLog().debug({ chatId: ctx.chat?.id }, 'telegram.message_dropped_no_handler');
-      }
+    // Voice / audio / video-note handler — transcribe then route
+    this.bot.on(['message:voice', 'message:audio', 'message:video_note'], ctx => {
+      const kind: 'voice' | 'audio' | 'video_note' = ctx.message?.voice
+        ? 'voice'
+        : ctx.message?.audio
+          ? 'audio'
+          : 'video_note';
+      // Fire-and-forget: errors are handled inside handleAudioMessage by
+      // replying to the user, never re-thrown out of the handler.
+      void this.handleAudioMessage(ctx, kind);
     });
 
     // Retry on 409 Conflict — another getUpdates is still active (Telegram's long-poll timeout is 50s).
