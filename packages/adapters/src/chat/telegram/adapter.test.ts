@@ -286,6 +286,70 @@ describe('TelegramAdapter', () => {
     });
   });
 
+  describe('withTyping indicator', () => {
+    let adapter: TelegramAdapter;
+    let mockSendChatAction: Mock<() => Promise<boolean>>;
+
+    beforeEach(() => {
+      adapter = new TelegramAdapter('fake-token-for-testing');
+      mockSendChatAction = mock(() => Promise.resolve(true));
+      (
+        adapter.getBot().api as unknown as { sendChatAction: typeof mockSendChatAction }
+      ).sendChatAction = mockSendChatAction;
+    });
+
+    const makeCtx = (chatId?: number, threadId?: number): unknown => ({
+      chat: chatId !== undefined ? { id: chatId } : undefined,
+      message: threadId !== undefined ? { message_thread_id: threadId } : undefined,
+    });
+
+    const callWithTyping = (ctx: unknown, fn: () => Promise<unknown>): Promise<unknown> =>
+      (
+        adapter as unknown as {
+          withTyping: (ctx: unknown, fn: () => Promise<unknown>) => Promise<unknown>;
+        }
+      ).withTyping(ctx, fn);
+
+    test('fires "typing" chat action immediately on entry', async () => {
+      await callWithTyping(makeCtx(12345), () => Promise.resolve());
+      expect(mockSendChatAction).toHaveBeenCalledWith(12345, 'typing', undefined);
+    });
+
+    test('propagates forum message_thread_id into chat action extra', async () => {
+      await callWithTyping(makeCtx(-1001234567890, 7), () => Promise.resolve());
+      expect(mockSendChatAction).toHaveBeenCalledWith(-1001234567890, 'typing', {
+        message_thread_id: 7,
+      });
+    });
+
+    test('no-ops and still runs fn when ctx has no chat id', async () => {
+      const fn = mock(() => Promise.resolve('ok'));
+      const result = await callWithTyping(makeCtx(undefined), fn);
+      expect(mockSendChatAction).not.toHaveBeenCalled();
+      expect(fn).toHaveBeenCalled();
+      expect(result).toBe('ok');
+    });
+
+    test('awaits fn and returns its value', async () => {
+      const result = await callWithTyping(makeCtx(12345), async () => {
+        await new Promise(r => setTimeout(r, 10));
+        return 'handled';
+      });
+      expect(result).toBe('handled');
+    });
+
+    test('propagates handler errors (interval still cleared by finally block)', async () => {
+      const err = new Error('handler boom');
+      await expect(callWithTyping(makeCtx(12345), () => Promise.reject(err))).rejects.toBe(err);
+    });
+
+    test('swallows sendChatAction errors so typing never breaks handler', async () => {
+      mockSendChatAction.mockRejectedValueOnce(new Error('telegram api down'));
+      const result = await callWithTyping(makeCtx(12345), () => Promise.resolve('ok'));
+      expect(result).toBe('ok');
+    });
+  });
+
   describe('getConversationId', () => {
     test('should return chat.id as string for private chat', () => {
       const adapter = new TelegramAdapter('fake-token-for-testing');

@@ -38,6 +38,15 @@ const MAX_LENGTH = 4096;
  */
 const CHUNK_TARGET_SIZE = Math.floor(MAX_LENGTH / 2);
 
+/**
+ * Refresh interval for the "typing…" chat action. Telegram clears the
+ * indicator ~5 seconds after the last `sendChatAction` call, so 4 s keeps
+ * it continuously visible with a small safety margin. The indicator is
+ * auto-cleared as soon as the bot sends an actual message, so the loop
+ * cooperates with `sendMessage` rather than racing it.
+ */
+const TYPING_REFRESH_MS = 4000;
+
 export class TelegramAdapter implements IPlatformAdapter {
   private bot: Bot;
   private streamingMode: 'stream' | 'batch';
@@ -329,8 +338,48 @@ export class TelegramAdapter implements IPlatformAdapter {
       { chatId: ctx.chat?.id, threadId, conversationId, chatType: ctx.chat?.type, source },
       'telegram.message_received'
     );
-    // Fire-and-forget - errors handled by caller
-    void this.messageHandler({ conversationId, message, userId });
+    const handler = this.messageHandler;
+    // Fire-and-forget - errors handled by caller. Wrapped in withTyping so
+    // the user sees a "typing…" indicator while the orchestrator thinks;
+    // Telegram auto-clears the indicator when the first real chunk goes out.
+    void this.withTyping(ctx, () => handler({ conversationId, message, userId }));
+  }
+
+  /**
+   * Wrap an async operation with a Telegram "typing…" chat action loop.
+   * Fires the action immediately, refreshes every {@link TYPING_REFRESH_MS},
+   * and always clears the interval (even on handler error) so intervals
+   * never leak. Forum-topic thread IDs are propagated so the indicator
+   * appears in the correct topic, not the chat root.
+   *
+   * Errors from `sendChatAction` are intentionally swallowed — a failing
+   * typing indicator must never break message handling.
+   */
+  private async withTyping<T>(ctx: Context, fn: () => Promise<T>): Promise<T> {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) {
+      return fn();
+    }
+    const msg = ctx.message;
+    const threadId =
+      msg && 'message_thread_id' in msg
+        ? (msg as { message_thread_id?: number }).message_thread_id
+        : undefined;
+    const extra = threadId !== undefined ? { message_thread_id: threadId } : undefined;
+
+    const send = (): void => {
+      this.bot.api.sendChatAction(chatId, 'typing', extra).catch((err: unknown) => {
+        getLog().debug({ err, chatId, threadId }, 'telegram.chat_action_failed');
+      });
+    };
+
+    send();
+    const interval = setInterval(send, TYPING_REFRESH_MS);
+    try {
+      return await fn();
+    } finally {
+      clearInterval(interval);
+    }
   }
 
   /**
