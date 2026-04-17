@@ -86,28 +86,84 @@ export class TelegramAdapter implements IPlatformAdapter {
   }
 
   /**
-   * Send a single chunk with MarkdownV2 formatting, with fallback to plain text.
+   * Send plain text (no parse_mode), splitting on line boundaries when over
+   * MAX_LENGTH. Returns true on success, false when any sub-chunk fails —
+   * callers treat false as "delivery failed, inform upstream" rather than
+   * silently swallowing. Throws are caught and converted into a logged
+   * failure so this never bubbles as an unhandled rejection.
+   */
+  private async sendPlainTextSafe(
+    id: number,
+    text: string,
+    threadExtra: { message_thread_id: number } | undefined,
+    context: { reason: string; chunkLength: number; threadId?: number }
+  ): Promise<boolean> {
+    try {
+      if (text.length <= MAX_LENGTH) {
+        await this.bot.api.sendMessage(id, text, threadExtra);
+        getLog().debug({ ...context, sentLength: text.length }, 'telegram.plain_text_chunk_sent');
+        return true;
+      }
+
+      // Sub-split by lines, preserving original boundaries.
+      const lines = text.split('\n');
+      let subChunk = '';
+      let subCount = 0;
+      for (const line of lines) {
+        if (subChunk.length + line.length + 1 > MAX_LENGTH - 100) {
+          if (subChunk) {
+            await this.bot.api.sendMessage(id, subChunk, threadExtra);
+            subCount++;
+          }
+          subChunk = line;
+        } else {
+          subChunk += (subChunk ? '\n' : '') + line;
+        }
+      }
+      if (subChunk) {
+        await this.bot.api.sendMessage(id, subChunk, threadExtra);
+        subCount++;
+      }
+      getLog().debug(
+        { ...context, subChunks: subCount, textLength: text.length },
+        'telegram.plain_text_split_sent'
+      );
+      return true;
+    } catch (error) {
+      const err = error as Error;
+      getLog().error(
+        { err, ...context, textPreview: text.substring(0, 200), textLength: text.length },
+        'telegram.plain_text_send_failed'
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Send a single chunk with MarkdownV2 formatting, with bulletproof
+   * fallback to plain text (guarantees the user sees _something_ even when
+   * MarkdownV2 escaping has a bug).
+   *
    * If threadId is provided, sends to that forum topic.
    */
   private async sendFormattedChunk(id: number, chunk: string, threadId?: number): Promise<void> {
     // Build options: include thread ID only when targeting a forum topic
     const threadExtra = threadId ? { message_thread_id: threadId } : undefined;
 
-    // If chunk is still too long after paragraph splitting, fall back to plain text
+    // If chunk is still too long after paragraph splitting, skip MarkdownV2
+    // attempt and go straight to plain-text delivery.
     if (chunk.length > MAX_LENGTH) {
       getLog().debug({ chunkLength: chunk.length }, 'telegram.chunk_too_long_plain_text');
-      const plainText = stripMarkdown(chunk);
-      const lines = plainText.split('\n');
-      let subChunk = '';
-      for (const line of lines) {
-        if (subChunk.length + line.length + 1 > MAX_LENGTH - 100) {
-          if (subChunk) await this.bot.api.sendMessage(id, subChunk, threadExtra);
-          subChunk = line;
-        } else {
-          subChunk += (subChunk ? '\n' : '') + line;
-        }
+      const ok = await this.sendPlainTextSafe(id, stripMarkdown(chunk), threadExtra, {
+        reason: 'chunk_too_long',
+        chunkLength: chunk.length,
+        threadId,
+      });
+      if (!ok) {
+        throw new Error(
+          `Failed to deliver ${String(chunk.length)}-char chunk to Telegram (plain text path)`
+        );
       }
-      if (subChunk) await this.bot.api.sendMessage(id, subChunk, threadExtra);
       return;
     }
 
@@ -129,7 +185,19 @@ export class TelegramAdapter implements IPlatformAdapter {
         },
         'telegram.markdownv2_failed'
       );
-      await this.bot.api.sendMessage(id, stripMarkdown(chunk), threadExtra);
+      const ok = await this.sendPlainTextSafe(id, stripMarkdown(chunk), threadExtra, {
+        reason: 'markdownv2_fallback',
+        chunkLength: chunk.length,
+        threadId,
+      });
+      if (!ok) {
+        // Both paths failed — surface this rather than swallowing, so the
+        // caller's retry/logging logic can react.
+        throw new Error(
+          `Failed to deliver ${String(chunk.length)}-char chunk to Telegram ` +
+            '(MarkdownV2 rejected, plain-text fallback also failed)'
+        );
+      }
     }
   }
 

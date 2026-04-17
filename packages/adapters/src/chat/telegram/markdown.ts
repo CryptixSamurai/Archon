@@ -42,11 +42,77 @@ export function convertToTelegramMarkdown(markdown: string): string {
     // MarkdownV2 requires single asterisk *bold* not double **bold**
     result = fixRemainingDoubleBold(result);
 
+    // Post-processing: collapse `\\X` → `\X` for reserved chars inside Markdown
+    // tables where telegramify-markdown double-escapes. Without this,
+    // Telegram reads `\\` as a literal backslash and then rejects the bare
+    // reserved char with 400 "can't parse entities".
+    result = fixDoubleEscapedReservedChars(result);
+
     return result;
   } catch (error) {
     getLog().warn({ err: error }, 'telegram.markdown_conversion_failed');
     return escapeMarkdownV2(markdown);
   }
+}
+
+/**
+ * Collapse `\\X` → `\X` for MarkdownV2 reserved characters (only outside
+ * code blocks and inline code where different escape rules apply).
+ *
+ * This fixes a bug in `telegramify-markdown` where reserved characters
+ * inside Markdown table cells are escaped twice, e.g. a table cell
+ * `V1 (< 04-08)` becomes `V1 \\(< 04\\-08\\)` instead of the correct
+ * `V1 \(< 04\-08\)`. The double-escape is interpreted by Telegram as
+ * "escaped backslash + unescaped paren" → 400 parse error.
+ *
+ * A preceding `\` is used as a guard to preserve intentional
+ * `\\\X` sequences (literal backslash + escaped reserved char).
+ */
+function fixDoubleEscapedReservedChars(text: string): string {
+  const reserved = new Set('_*[]()~`>#+-=|{}.!'.split(''));
+  let out = '';
+  let i = 0;
+  let inCodeBlock = false;
+  let inInlineCode = false;
+
+  while (i < text.length) {
+    // Toggle on ``` fences (only when not inside inline code)
+    if (!inInlineCode && text.substring(i, i + 3) === '```') {
+      inCodeBlock = !inCodeBlock;
+      out += '```';
+      i += 3;
+      continue;
+    }
+    // Toggle on ` inline-code fences (only when not inside a block)
+    if (!inCodeBlock && text[i] === '`') {
+      inInlineCode = !inInlineCode;
+      out += '`';
+      i++;
+      continue;
+    }
+    // Inside code — copy verbatim (telegramify handles code-body escaping
+    // separately; double-reserved-escape bug is observed only outside code).
+    if (inCodeBlock || inInlineCode) {
+      out += text[i];
+      i++;
+      continue;
+    }
+    // Outside code: detect `\\X` where X is reserved, not preceded by `\`.
+    if (
+      text[i] === '\\' &&
+      text[i + 1] === '\\' &&
+      i + 2 < text.length &&
+      reserved.has(text[i + 2]) &&
+      text[i - 1] !== '\\'
+    ) {
+      out += '\\' + text[i + 2];
+      i += 3;
+      continue;
+    }
+    out += text[i];
+    i++;
+  }
+  return out;
 }
 
 /**

@@ -83,6 +83,38 @@ describe('telegram-markdown', () => {
         expect(result).toContain('Hello world');
       });
     });
+
+    // Regression: telegramify-markdown double-escapes reserved chars inside
+    // Markdown table cells, producing `\\(`, `\\-`, `\\)` which Telegram
+    // parses as "literal backslash + unescaped reserved char" → 400.
+    // See Archon-4lw / session 2026-04-17 for the original failure.
+    describe('double-escape collapse (telegramify table bug)', () => {
+      test('collapses \\\\( to \\( in table cells', () => {
+        const input = '| V1 (< 04-08) | V2 (≥ 04-08) |';
+        const result = convertToTelegramMarkdown(input);
+        // No remaining \\X where X is a reserved char (outside code)
+        expect(result).not.toMatch(/(?<!\\)\\\\[()_*[\]~`>#+\-=|{}.!]/);
+        // Parens still individually escaped once
+        expect(result).toContain('\\(');
+        expect(result).toContain('\\)');
+      });
+
+      test('collapses \\\\- range separator (common in V1 (< 04-08) pattern)', () => {
+        const input = '| date | 04-08 |';
+        const result = convertToTelegramMarkdown(input);
+        expect(result).not.toMatch(/(?<!\\)\\\\-/);
+      });
+
+      test('does not collapse \\\\X inside code blocks', () => {
+        // Reserved-char escape rules differ inside code — the double-escape
+        // bug is only observed outside code, so we must leave code content
+        // alone to avoid regressions.
+        const input = '```\nliteral \\\\( in code\n```';
+        const result = convertToTelegramMarkdown(input);
+        // \\\\( preserved inside the fenced block
+        expect(result).toContain('\\\\(');
+      });
+    });
   });
 
   describe('escapeMarkdownV2', () => {
