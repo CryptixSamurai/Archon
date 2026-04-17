@@ -601,9 +601,15 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     const telegramAdapter = telegram; // Capture for use in callback
 
     // Register message handler (auth is handled internally by adapter)
+    // NOTE: we now await lockManager.acquireLock so the handler's returned
+    // Promise tracks actual orchestrator completion. The adapter's
+    // withTyping loop lives between this Promise's start and resolve, which
+    // is how the "typing…" indicator stays visible for the full AI turn.
+    // The grammY polling loop is NOT blocked because the adapter wraps this
+    // handler in `void this.withTyping(...)` — `bot.on` sees an immediate
+    // return there, not the long-running orchestrator.
     telegramAdapter.onMessage(async ({ conversationId, message }) => {
-      // Fire-and-forget: handler returns immediately, processing happens async
-      lockManager
+      await lockManager
         .acquireLock(conversationId, async () => {
           await handleMessage(telegramAdapter, conversationId, message, {
             isolationHints: { workflowType: 'thread', workflowId: conversationId },
