@@ -110,6 +110,33 @@ export class ConversationLockManager {
   }
 
   /**
+   * Acquire a lock and await the handler's completion.
+   * Unlike {@link acquireLock}, this resolves only after the handler finishes
+   * (or rejects with its error), which is needed by callers that must track
+   * real completion — e.g. the Telegram adapter's typing-indicator loop,
+   * which keeps showing "typing…" until the handler's Promise resolves.
+   *
+   * Queueing semantics match acquireLock exactly: concurrent messages for
+   * the same conversation run serially, per-conversation queue position is
+   * preserved, and global concurrency is still capped by maxConcurrent.
+   *
+   * @param conversationId - Unique conversation identifier
+   * @param handler - Async function to execute
+   */
+  async withLock(conversationId: string, handler: () => Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.acquireLock(conversationId, async () => {
+        try {
+          await handler();
+          resolve();
+        } catch (err) {
+          reject(err as Error);
+        }
+      }).catch(reject);
+    });
+  }
+
+  /**
    * Add message to conversation queue
    * @param conversationId - Unique conversation identifier
    * @param handler - Async function to queue

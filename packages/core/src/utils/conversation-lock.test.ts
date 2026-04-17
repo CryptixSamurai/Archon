@@ -202,4 +202,50 @@ describe('ConversationLockManager', () => {
     // Wait for completion
     await new Promise(resolve => setTimeout(resolve, 100));
   });
+
+  describe('withLock', () => {
+    test('resolves only after handler completes (unlike acquireLock)', async () => {
+      const manager = new ConversationLockManager(10);
+      const phases: string[] = [];
+
+      const awaited = manager.withLock('conv-w', async () => {
+        phases.push('handler-start');
+        await new Promise(resolve => setTimeout(resolve, 50));
+        phases.push('handler-end');
+      });
+
+      phases.push('post-call');
+      await awaited;
+      phases.push('post-await');
+
+      expect(phases).toEqual(['handler-start', 'post-call', 'handler-end', 'post-await']);
+    });
+
+    test('rejects with the handler error', async () => {
+      const manager = new ConversationLockManager(10);
+      const err = new Error('handler boom');
+      await expect(
+        manager.withLock('conv-w', async () => {
+          throw err;
+        })
+      ).rejects.toBe(err);
+    });
+
+    test('serializes concurrent withLock calls for the same conversation', async () => {
+      const manager = new ConversationLockManager(10);
+      const order: number[] = [];
+
+      const first = manager.withLock('conv-serial', async () => {
+        order.push(1);
+        await new Promise(resolve => setTimeout(resolve, 30));
+        order.push(2);
+      });
+      const second = manager.withLock('conv-serial', async () => {
+        order.push(3);
+      });
+
+      await Promise.all([first, second]);
+      expect(order).toEqual([1, 2, 3]);
+    });
+  });
 });
