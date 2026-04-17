@@ -263,6 +263,27 @@ describe('TelegramAdapter', () => {
       // Silence unused warnings (hugeLine is for documentation intent)
       expect(hugeLine.length).toBeGreaterThan(0);
     });
+
+    test('suppresses tool_call_formatted metadata (mirrors WebAdapter)', async () => {
+      await adapter.sendMessage('12345', '🔧 BASH', { category: 'tool_call_formatted' });
+      expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    test('suppresses isolation_context metadata (mirrors WebAdapter)', async () => {
+      await adapter.sendMessage('12345', 'Reusing worktree from issue #99', {
+        category: 'isolation_context',
+      });
+      expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    test('still delivers workflow_status / workflow_result metadata to chat', async () => {
+      await adapter.sendMessage('12345', '🚀 Running workflow', { category: 'workflow_status' });
+      await adapter.sendMessage('12345', 'Workflow done', {
+        category: 'workflow_result',
+        workflowResult: { workflowName: 'assist', runId: 'run-1' },
+      });
+      expect(mockSendMessage).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('getConversationId', () => {

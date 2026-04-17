@@ -76,7 +76,21 @@ export class TelegramAdapter implements IPlatformAdapter {
    * - If chatId contains ":" (e.g. "-100123456:789"), the second part is the
    *   message_thread_id and replies go to that specific forum topic.
    */
-  async sendMessage(chatId: string, message: string, _metadata?: MessageMetadata): Promise<void> {
+  async sendMessage(chatId: string, message: string, metadata?: MessageMetadata): Promise<void> {
+    // Mirror WebAdapter: categories surfaced as structured UI cards in the web
+    // client have no useful equivalent in a plain chat and only produce noise
+    // (per-tool "🔧 BASH" lines, worktree-reuse notices, etc).
+    if (
+      metadata?.category === 'tool_call_formatted' ||
+      metadata?.category === 'isolation_context'
+    ) {
+      getLog().debug(
+        { chatId, category: metadata.category, messageLength: message.length },
+        'telegram.send_message_suppressed'
+      );
+      return;
+    }
+
     const { numericChatId, threadId } = this.parseChatId(chatId);
     getLog().debug({ chatId, threadId, messageLength: message.length }, 'telegram.send_message');
 
