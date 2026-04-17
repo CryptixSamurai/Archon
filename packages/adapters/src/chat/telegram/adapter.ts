@@ -19,6 +19,24 @@ function getLog(): ReturnType<typeof createLogger> {
 
 const MAX_LENGTH = 4096;
 
+/**
+ * Conservative per-paragraph chunk size fed to `splitIntoParagraphChunks`.
+ *
+ * We target half of MAX_LENGTH rather than `MAX_LENGTH - 200` because
+ * `convertToTelegramMarkdown` inflates the text with escape backslashes —
+ * a row of a Markdown table with parens and dates can grow by 60-80%.
+ * Without this buffer, escape-heavy chunks that are well under 4096 chars
+ * in source form blow past the limit after conversion and Telegram rejects
+ * them with `400: message is too long` BEFORE even parsing entities,
+ * triggering the plain-text fallback on every chunk (or silently dropping
+ * updates when the fallback itself can't be delivered).
+ *
+ * 2048 leaves ~2 KB of headroom — enough for the worst escape patterns we've
+ * observed (tables + regex-dense prose) while still giving users reasonably
+ * sized messages.
+ */
+const CHUNK_TARGET_SIZE = Math.floor(MAX_LENGTH / 2);
+
 export class TelegramAdapter implements IPlatformAdapter {
   private bot: Bot;
   private streamingMode: 'stream' | 'batch';
@@ -65,7 +83,7 @@ export class TelegramAdapter implements IPlatformAdapter {
       await this.sendFormattedChunk(numericChatId, message, threadId);
     } else {
       getLog().debug({ messageLength: message.length }, 'telegram.message_splitting');
-      const chunks = splitIntoParagraphChunks(message, MAX_LENGTH - 200);
+      const chunks = splitIntoParagraphChunks(message, CHUNK_TARGET_SIZE);
 
       for (const chunk of chunks) {
         await this.sendFormattedChunk(numericChatId, chunk, threadId);
@@ -101,7 +119,8 @@ export class TelegramAdapter implements IPlatformAdapter {
     try {
       if (text.length <= MAX_LENGTH) {
         await this.bot.api.sendMessage(id, text, threadExtra);
-        getLog().debug({ ...context, sentLength: text.length }, 'telegram.plain_text_chunk_sent');
+        // info level: delivery outcomes are low-volume + critical for diagnosis.
+        getLog().info({ ...context, sentLength: text.length }, 'telegram.plain_text_chunk_sent');
         return true;
       }
 
@@ -124,7 +143,7 @@ export class TelegramAdapter implements IPlatformAdapter {
         await this.bot.api.sendMessage(id, subChunk, threadExtra);
         subCount++;
       }
-      getLog().debug(
+      getLog().info(
         { ...context, subChunks: subCount, textLength: text.length },
         'telegram.plain_text_split_sent'
       );
@@ -174,7 +193,7 @@ export class TelegramAdapter implements IPlatformAdapter {
       : { parse_mode: 'MarkdownV2' as const };
     try {
       await this.bot.api.sendMessage(id, formatted, markdownOptions);
-      getLog().debug({ chunkLength: chunk.length, threadId }, 'telegram.markdownv2_chunk_sent');
+      getLog().info({ chunkLength: chunk.length, threadId }, 'telegram.markdownv2_chunk_sent');
     } catch (error) {
       const err = error as Error;
       getLog().warn(

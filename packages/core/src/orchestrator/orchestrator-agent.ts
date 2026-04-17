@@ -16,6 +16,7 @@ import type {
   Conversation,
   Codebase,
   AttachedFile,
+  MessageMetadata,
 } from '../types';
 import type { SendQueryOptions } from '@archon/providers/types';
 import { ConversationNotFoundError } from '../types';
@@ -987,6 +988,43 @@ export async function handleMessage(
 // ─── Streaming Mode ─────────────────────────────────────────────────────────
 
 /**
+ * Deliver one UI-bound chunk to the platform without aborting the caller's
+ * `for await` loop over the AI stream.
+ *
+ * Why this exists: when an adapter's `sendMessage` throws (e.g. Telegram
+ * rejects a too-long post-escape chunk and the plain-text fallback also
+ * fails), we used to let the error propagate out of the streaming loop.
+ * That killed the loop, stranded the Claude SDK subprocess, and left the
+ * workflow row as `running` in the DB forever — the user saw silence while
+ * the DAG node never completed.
+ *
+ * Delivery failures are UI concerns, not correctness concerns: we log them
+ * loudly (so operators can see), swallow them here, and let the rest of the
+ * stream (and subsequent DAG nodes) proceed normally.
+ */
+async function safeDeliver(
+  platform: IPlatformAdapter,
+  conversationId: string,
+  message: string,
+  metadata?: MessageMetadata
+): Promise<void> {
+  try {
+    await platform.sendMessage(conversationId, message, metadata);
+  } catch (error) {
+    getLog().error(
+      {
+        err: toError(error),
+        conversationId,
+        messageLength: message.length,
+        messagePreview: message.slice(0, 120),
+        platformType: platform.getPlatformType?.() ?? 'unknown',
+      },
+      'orchestrator.delivery_failed'
+    );
+  }
+}
+
+/**
  * Stream mode: send text chunks immediately for real-time UX (web, Telegram stream).
  * If an orchestrator command is detected, retract streamed text and dispatch.
  */
@@ -1028,13 +1066,13 @@ async function handleStreamMode(
         ) {
           commandDetected = true;
         } else {
-          await platform.sendMessage(conversationId, msg.content);
+          await safeDeliver(platform, conversationId, msg.content);
         }
       }
     } else if (msg.type === 'tool' && msg.toolName) {
       if (!commandDetected) {
         const toolMessage = formatToolCall(msg.toolName, msg.toolInput);
-        await platform.sendMessage(conversationId, toolMessage, {
+        await safeDeliver(platform, conversationId, toolMessage, {
           category: 'tool_call_formatted',
         });
         if (platform.sendStructuredEvent) {
@@ -1052,7 +1090,7 @@ async function handleStreamMode(
       if (msg.isError) {
         getLog().warn({ conversationId, errorSubtype: msg.errorSubtype }, 'ai_result_error');
         const syntheticError = new Error(msg.errorSubtype ?? 'AI result error');
-        await platform.sendMessage(conversationId, classifyAndFormatError(syntheticError));
+        await safeDeliver(platform, conversationId, classifyAndFormatError(syntheticError));
         if (newSessionId) {
           await tryPersistSessionId(session.id, newSessionId);
         }
@@ -1179,7 +1217,7 @@ async function handleBatchMode(
       if (msg.isError) {
         getLog().warn({ conversationId, errorSubtype: msg.errorSubtype }, 'ai_result_error');
         const syntheticError = new Error(msg.errorSubtype ?? 'AI result error');
-        await platform.sendMessage(conversationId, classifyAndFormatError(syntheticError));
+        await safeDeliver(platform, conversationId, classifyAndFormatError(syntheticError));
         if (newSessionId) {
           await tryPersistSessionId(session.id, newSessionId);
         }
