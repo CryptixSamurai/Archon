@@ -368,9 +368,16 @@ export class TelegramAdapter implements IPlatformAdapter {
     const extra = threadId !== undefined ? { message_thread_id: threadId } : undefined;
 
     const send = (): void => {
-      this.bot.api.sendChatAction(chatId, 'typing', extra).catch((err: unknown) => {
-        getLog().debug({ err, chatId, threadId }, 'telegram.chat_action_failed');
-      });
+      this.bot.api
+        .sendChatAction(chatId, 'typing', extra)
+        .then(() => {
+          getLog().debug({ chatId, threadId }, 'telegram.chat_action_sent');
+        })
+        .catch((err: unknown) => {
+          // Log failures at warn level — silent failures here mean users see
+          // no typing indicator and cannot tell if we even tried.
+          getLog().warn({ err, chatId, threadId }, 'telegram.chat_action_failed');
+        });
     };
 
     send();
