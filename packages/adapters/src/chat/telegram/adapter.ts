@@ -375,9 +375,21 @@ export class TelegramAdapter implements IPlatformAdapter {
     }
 
     // 3. Transcribe via Groq Whisper
+    //
+    // Groq validates file type by filename extension (not content-type).
+    // Telegram voice notes arrive with `.oga` (OGG audio, legacy alias),
+    // which Groq rejects — its allow-list is flac/mp3/mp4/mpeg/mpga/m4a/
+    // ogg/opus/wav/webm. Normalise per message kind so we always present
+    // an accepted extension.
+    const filename =
+      kind === 'voice'
+        ? 'voice.ogg' // Telegram voice = OGG/Opus
+        : kind === 'video_note'
+          ? 'video.mp4' // Video circles are MP4
+          : (file.file_path.split('/').pop() ?? 'audio.mp3'); // Regular audio keeps original name
+
     let transcriptText: string;
     try {
-      const filename = file.file_path.split('/').pop() ?? `${kind}.ogg`;
       const result = await transcribeAudio(audioBytes, filename);
       transcriptText = result.text.trim();
       if (!transcriptText) {
