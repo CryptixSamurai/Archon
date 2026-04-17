@@ -16,6 +16,7 @@
     "./defaults": "./src/defaults/bundled-defaults.ts",
     "./validator": "./src/validator.ts",
     "./utils/tool-formatter": "./src/utils/tool-formatter.ts",
+    "./utils/idle-timeout": "./src/utils/idle-timeout.ts",
     "./test-utils": "./src/test-utils.ts"
   },
   "scripts": {

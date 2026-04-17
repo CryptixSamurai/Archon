@@ -31,6 +31,7 @@ const mockDeactivateSession = mock(() => Promise.resolve());
 
 // Workflow database mocks
 const mockGetActiveWorkflowRun = mock(() => Promise.resolve(null));
+const mockGetActiveWorkflowRunByPath = mock(() => Promise.resolve(null));
 const mockCancelWorkflowRun = mock(() => Promise.resolve());
 const mockListWorkflowRuns = mock(() => Promise.resolve([]));
 const mockGetWorkflowRun = mock(() => Promise.resolve(null));
@@ -82,6 +83,7 @@ mock.module('../db/sessions', () => ({
 
 mock.module('../db/workflows', () => ({
   getActiveWorkflowRun: mockGetActiveWorkflowRun,
+  getActiveWorkflowRunByPath: mockGetActiveWorkflowRunByPath,
   cancelWorkflowRun: mockCancelWorkflowRun,
   listWorkflowRuns: mockListWorkflowRuns,
   getWorkflowRun: mockGetWorkflowRun,
@@ -222,6 +224,7 @@ function clearAllMocks(): void {
   mockDeactivateSession.mockClear();
   // Workflow db mocks
   mockGetActiveWorkflowRun.mockClear();
+  mockGetActiveWorkflowRunByPath.mockClear();
   mockCancelWorkflowRun.mockClear();
   mockListWorkflowRuns.mockClear();
   mockGetWorkflowRun.mockClear();
@@ -1518,6 +1521,98 @@ describe('CommandHandler', () => {
 
         expect(result.success).toBe(false);
         expect(result.message).toContain('Failed to abandon');
+      });
+    });
+
+    describe('/workflow recover', () => {
+      test('abandons stale running run and returns retry hint', async () => {
+        const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+        const staleRun = {
+          id: 'stale-run-id',
+          workflow_name: 'archon-assist',
+          conversation_id: 'conv-1',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'running' as const,
+          user_message: 'research OFM',
+          metadata: {},
+          started_at: twoHoursAgo,
+          completed_at: null,
+          last_activity_at: twoHoursAgo,
+          working_path: '/tmp/worktree',
+        };
+        mockGetActiveWorkflowRunByPath.mockResolvedValueOnce(staleRun);
+        // abandonWorkflow() first calls getWorkflowRun(id), then cancelWorkflowRun(id)
+        mockGetWorkflowRun.mockResolvedValueOnce(staleRun);
+
+        const result = await handleCommand(baseConversation, '/workflow recover');
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('Recovered');
+        expect(result.message).toContain('archon-assist');
+        expect(result.message).toContain('Retry your command');
+        expect(mockCancelWorkflowRun).toHaveBeenCalledWith('stale-run-id');
+      });
+
+      test('refuses to abandon a fresh running run', async () => {
+        const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000);
+        const freshRun = {
+          id: 'fresh-run-id',
+          workflow_name: 'archon-implement',
+          conversation_id: 'conv-1',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'running' as const,
+          user_message: 'impl',
+          metadata: {},
+          started_at: tenMinutesAgo,
+          completed_at: null,
+          last_activity_at: tenMinutesAgo,
+          working_path: '/tmp/worktree',
+        };
+        mockGetActiveWorkflowRunByPath.mockResolvedValueOnce(freshRun);
+
+        const result = await handleCommand(baseConversation, '/workflow recover');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('still active');
+        expect(result.message).toContain('/workflow cancel');
+        expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
+      });
+
+      test('reports nothing-to-do when no blocking run exists', async () => {
+        mockGetActiveWorkflowRunByPath.mockResolvedValueOnce(null);
+
+        const result = await handleCommand(baseConversation, '/workflow recover');
+
+        expect(result.success).toBe(true);
+        expect(result.message).toContain('No active workflow blocks this path');
+        expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
+      });
+
+      test('rejects recover when blocker is paused (wrong tool for the job)', async () => {
+        const pausedRun = {
+          id: 'paused-run-id',
+          workflow_name: 'archon-implement',
+          conversation_id: 'conv-1',
+          parent_conversation_id: null,
+          codebase_id: null,
+          status: 'paused' as const,
+          user_message: 'impl',
+          metadata: {},
+          started_at: new Date(),
+          completed_at: null,
+          last_activity_at: null,
+          working_path: '/tmp/worktree',
+        };
+        mockGetActiveWorkflowRunByPath.mockResolvedValueOnce(pausedRun);
+
+        const result = await handleCommand(baseConversation, '/workflow recover');
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('paused');
+        expect(result.message).toContain('/workflow approve');
+        expect(mockCancelWorkflowRun).not.toHaveBeenCalled();
       });
     });
 

@@ -893,5 +893,57 @@ describe('executeWorkflow', () => {
       expect(msg).toContain('running 1m');
       expect(msg).toContain('Wait for it to finish');
     });
+
+    it('uses stale-orphan copy when running blocker has no activity past threshold', async () => {
+      // last_activity_at 2h ago > STALE_LOCK_THRESHOLD_MS (60 min) → likely orphan
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+      const staleRun = makeRun({
+        id: 'stale-run-id',
+        workflow_name: 'archon-assist',
+        status: 'running',
+        started_at: twoHoursAgo,
+        last_activity_at: twoHoursAgo,
+      });
+      const sendMessageSpy = mock(async () => {});
+      const platform = {
+        sendMessage: sendMessageSpy,
+        getPlatformType: mock(() => 'test' as const),
+      } as unknown as IWorkflowPlatform;
+      const store = makeStore({ getActiveWorkflowRunByPath: mock(async () => staleRun) });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(deps, platform, 'conv-1', '/tmp', makeWorkflow(), 'test', 'db-conv-1');
+
+      const msg = (sendMessageSpy.mock.calls[0] as [string, string])[1];
+      expect(msg).toContain('likely orphan');
+      expect(msg).toContain('/workflow recover');
+      // Must not tell the user to "wait" on a likely-dead run
+      expect(msg).not.toContain('Wait for it to finish');
+    });
+
+    it('keeps regular running copy when last_activity_at is fresh', async () => {
+      // Row says started 2h ago, but last_activity_at is 5m ago — still active
+      const freshRun = makeRun({
+        id: 'fresh-run-id',
+        workflow_name: 'archon-assist',
+        status: 'running',
+        started_at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+        last_activity_at: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      });
+      const sendMessageSpy = mock(async () => {});
+      const platform = {
+        sendMessage: sendMessageSpy,
+        getPlatformType: mock(() => 'test' as const),
+      } as unknown as IWorkflowPlatform;
+      const store = makeStore({ getActiveWorkflowRunByPath: mock(async () => freshRun) });
+      const deps = makeDeps(store);
+
+      await executeWorkflow(deps, platform, 'conv-1', '/tmp', makeWorkflow(), 'test', 'db-conv-1');
+
+      const msg = (sendMessageSpy.mock.calls[0] as [string, string])[1];
+      expect(msg).not.toContain('likely orphan');
+      expect(msg).not.toContain('/workflow recover');
+      expect(msg).toContain('Wait for it to finish');
+    });
   });
 });

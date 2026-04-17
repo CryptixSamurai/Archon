@@ -20,6 +20,7 @@ import { getArchonWorkspacesPath } from '@archon/paths';
 import { loadConfig } from '../config/config-loader';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
+import { STALE_LOCK_THRESHOLD_MS } from '@archon/workflows/utils/idle-timeout';
 import type {
   WorkflowWithSource,
   WorkflowLoadError,
@@ -727,6 +728,65 @@ async function handleWorkflowCommand(
       }
     }
 
+    case 'recover': {
+      // Abandon a stale `running` row that's blocking this conversation's
+      // working path. Only fires when last_activity_at exceeds the stale
+      // threshold — fresh runs are protected, user must use /workflow cancel.
+      try {
+        const blockingRun = await workflowDb.getActiveWorkflowRunByPath(workflowCwd);
+        if (!blockingRun) {
+          return {
+            success: true,
+            message: 'No active workflow blocks this path. Retry your command.',
+          };
+        }
+        if (blockingRun.status !== 'running') {
+          const shortId = blockingRun.id.slice(0, 8);
+          const hint =
+            blockingRun.status === 'paused'
+              ? `Use \`/workflow approve ${shortId}\` or \`/workflow reject ${shortId} <reason>\`.`
+              : `Use \`/workflow cancel ${shortId}\`.`;
+          return {
+            success: false,
+            message: `Blocking run \`${blockingRun.workflow_name}\` is \`${blockingRun.status}\`, not running. ${hint}`,
+          };
+        }
+        const timing = calculateWorkflowTiming(blockingRun);
+        if (timing.lastActivityMs < STALE_LOCK_THRESHOLD_MS) {
+          const shortId = blockingRun.id.slice(0, 8);
+          const humanIdle = `${String(timing.lastActivityMin)}m`;
+          return {
+            success: false,
+            message:
+              `Blocking run \`${blockingRun.workflow_name}\` is still active ` +
+              `(last activity ${humanIdle} ago). ` +
+              `If you really want to stop it, use \`/workflow cancel ${shortId}\`.`,
+          };
+        }
+        const run = await abandonWorkflow(blockingRun.id);
+        const shortId = run.id.slice(0, 8);
+        const hours = Math.floor(timing.lastActivityMs / 3_600_000);
+        const mins = Math.floor((timing.lastActivityMs % 3_600_000) / 60_000);
+        const humanIdle = hours > 0 ? `${String(hours)}h ${String(mins)}m` : `${String(mins)}m`;
+        return {
+          success: true,
+          message:
+            `Recovered \`${run.workflow_name}\` (run ${shortId}, inactive ${humanIdle}). ` +
+            'Retry your command.',
+        };
+      } catch (error) {
+        const err = error as Error;
+        getLog().error(
+          { err, conversationId: conversation.id, cwd: workflowCwd },
+          'cmd.workflow_recover_failed'
+        );
+        return {
+          success: false,
+          message: `Failed to recover stale workflow: ${err.message}`,
+        };
+      }
+    }
+
     case 'approve': {
       const runId = args[1];
       if (!runId) {
@@ -882,7 +942,7 @@ async function handleWorkflowCommand(
       return {
         success: false,
         message:
-          'Usage:\n  /workflow list - Show available workflows\n  /workflow reload - Reload workflow definitions\n  /workflow status - Show all active workflows\n  /workflow cancel - Cancel running workflow\n  /workflow resume <id> - Resume a failed run\n  /workflow abandon <id> - Discard a failed run\n  /workflow approve <id> [comment] - Approve a paused run\n  /workflow reject <id> [reason] - Reject a paused run\n  /workflow run <name> [args] - Run a workflow directly',
+          'Usage:\n  /workflow list - Show available workflows\n  /workflow reload - Reload workflow definitions\n  /workflow status - Show all active workflows\n  /workflow cancel - Cancel running workflow\n  /workflow resume <id> - Resume a failed run\n  /workflow abandon <id> - Discard a failed run\n  /workflow recover - Abandon a stale (orphaned) run blocking this path\n  /workflow approve <id> [comment] - Approve a paused run\n  /workflow reject <id> [reason] - Reject a paused run\n  /workflow run <name> [args] - Run a workflow directly',
       };
   }
 }
@@ -915,6 +975,7 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
 - \`/workflow cancel\` — Cancel the active workflow
 - \`/workflow resume <id>\` — Resume a failed run
 - \`/workflow abandon <id>\` — Discard a failed run
+- \`/workflow recover\` — Abandon a stale (orphaned) run blocking this path
 - \`/workflow approve <id>\` — Approve a paused run
 - \`/workflow reject <id>\` — Reject a paused run
 

@@ -21,6 +21,21 @@
  */
 export const STEP_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
+/**
+ * Threshold after which a `running` workflow run is treated as "likely stale"
+ * by user-facing lock detection (60 min).
+ *
+ * Why 2× idle timeout: the in-memory idle timer lives inside the server
+ * process. A server crash or restart loses the timer, but the row stays
+ * `running` in the DB per the No Autonomous Lifecycle Mutation rule. After
+ * `STALE_LOCK_THRESHOLD_MS` of inactivity (no `last_activity_at` updates)
+ * the lock-conflict message surfaces a recovery hint (`/workflow recover`)
+ * instead of the generic "worktree is in use" error. The 2× margin ensures
+ * a legitimate node that's merely slower than the idle timeout is never
+ * misclassified — only truly silent runs trip it.
+ */
+export const STALE_LOCK_THRESHOLD_MS = 2 * STEP_IDLE_TIMEOUT_MS;
+
 /** Sentinel value to distinguish idle timeout from normal generator completion */
 const IDLE_TIMEOUT_SENTINEL = Symbol('IDLE_TIMEOUT');
 

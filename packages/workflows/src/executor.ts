@@ -12,6 +12,7 @@ import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from '.
 import { executeDagWorkflow } from './dag-executor';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
+import { STALE_LOCK_THRESHOLD_MS } from './utils/idle-timeout';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { inferProviderFromModel, isModelCompatible } from './model-validation';
 import { classifyError } from './executor-shared';
@@ -519,12 +520,31 @@ export async function executeWorkflow(
           `• Cancel it: \`/workflow cancel ${shortId}\`\n` +
           '• Use a different branch: `--branch <other>`';
       } else {
-        const verb = activeWorkflow.status === 'pending' ? 'starting' : 'running';
-        stateLine = `${verb} ${duration}, run \`${shortId}\``;
-        actionLines =
-          '• Wait for it to finish: `/workflow status`\n' +
-          `• Cancel it: \`/workflow cancel ${shortId}\`\n` +
-          '• Use a different branch: `--branch <other>`';
+        // Stale detection: `running` row whose last_activity_at is older than
+        // 2× idle timeout is likely orphaned (server restart lost the in-memory
+        // idle timer; row stays `running` per No Autonomous Lifecycle Mutation).
+        // Fall back to started_at when last_activity_at is null.
+        const lastActivityMs = activeWorkflow.last_activity_at
+          ? parseDbTimestamp(activeWorkflow.last_activity_at)
+          : parseDbTimestamp(activeWorkflow.started_at);
+        const idleMs = Math.max(0, Date.now() - lastActivityMs);
+        const isLikelyStale =
+          activeWorkflow.status === 'running' && idleMs >= STALE_LOCK_THRESHOLD_MS;
+
+        if (isLikelyStale) {
+          stateLine = `inactive ${formatDuration(idleMs)}, run \`${shortId}\` — likely orphan`;
+          actionLines =
+            '• Recover: `/workflow recover` (abandons this stale run)\n' +
+            `• Force-cancel: \`/workflow cancel ${shortId}\`\n` +
+            '• Use a different branch: `--branch <other>`';
+        } else {
+          const verb = activeWorkflow.status === 'pending' ? 'starting' : 'running';
+          stateLine = `${verb} ${duration}, run \`${shortId}\``;
+          actionLines =
+            '• Wait for it to finish: `/workflow status`\n' +
+            `• Cancel it: \`/workflow cancel ${shortId}\`\n` +
+            '• Use a different branch: `--branch <other>`';
+        }
       }
       await sendCriticalMessage(
         platform,
